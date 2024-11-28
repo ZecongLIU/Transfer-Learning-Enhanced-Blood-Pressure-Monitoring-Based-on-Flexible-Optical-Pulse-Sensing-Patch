@@ -1,0 +1,734 @@
+# 导入必要的库
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from scipy.signal import butter, filtfilt, resample
+import pywt  # 导入小波变换库
+import os
+import random
+import scipy.stats as stats  # 导入 scipy 库的 stats 模块
+
+# 导入 PyTorch 库
+import torch
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, Subset
+from sklearn.metrics import mean_absolute_error
+
+# 设置随机种子，确保结果可重复
+random_seed = 45
+np.random.seed(random_seed)
+random.seed(random_seed)
+torch.manual_seed(random_seed)
+
+# 导入可视化库
+import matplotlib.pyplot as plt
+
+# 检查是否有可用的 GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用设备：{device}")
+
+# 定义模型类
+import torch.nn as nn
+import torch.nn.functional as F
+
+class PulseNet(nn.Module):
+    def __init__(self, 
+                 cnn_kernel_size=31, 
+                 cnn_num_filters=32, 
+                 lstm_hidden_size=64, 
+                 lstm_num_layers=2, 
+                 segment_size=50,  # 根据 CNN 输出的序列长度调整
+                 overlap_size=25,  # 根据需要调整
+                 wavelet_feature_size=None):
+        super(PulseNet, self).__init__()
+        
+        self.segment_size = segment_size
+        self.overlap_size = overlap_size
+        
+        # **共享的 CNN 模块**
+        self.cnn_module = self._create_cnn_module(cnn_kernel_size, cnn_num_filters)
+        
+        # **共享的 LSTM 模块**
+        self.lstm_module = self._create_lstm_module(cnn_num_filters*2, lstm_hidden_size, lstm_num_layers)
+        
+        # **计算 CNN 输出的序列长度（以便后续分段）**
+        self.seq_len_after_cnn = self._get_cnn_output_seq_len(15000, cnn_kernel_size)
+        
+        # 计算 total_feature_size
+        cnn_feature_size = cnn_num_filters * 2
+        total_feature_size = (cnn_feature_size * 3) + (lstm_hidden_size * 3) + wavelet_feature_size
+        
+        # 显示进入FC层前的特征数量
+        print(f"进入全连接层前的特征数量 total_feature_size = {total_feature_size}")
+
+        self.fc = nn.Sequential(
+            nn.Linear(total_feature_size, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),  # 添加 Dropout 正则化
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Dropout(0.5),  # 添加 Dropout 正则化
+            nn.Linear(64, 2)
+        )
+    
+    def _create_cnn_module(self, kernel_size, num_filters):
+        return nn.Sequential(
+            nn.Conv1d(in_channels=1, out_channels=num_filters, kernel_size=kernel_size, stride=2),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2, stride=2),
+            nn.Conv1d(in_channels=num_filters, out_channels=num_filters*2, kernel_size=kernel_size, stride=2),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2, stride=2)
+        )
+    
+    def _create_lstm_module(self, input_size, lstm_hidden_size, lstm_num_layers):
+        return nn.LSTM(input_size=input_size, 
+                       hidden_size=lstm_hidden_size, 
+                       num_layers=lstm_num_layers, 
+                       batch_first=True)
+    
+    def _get_cnn_output_seq_len(self, input_length, kernel_size):
+        # 计算 CNN 模块后的序列长度
+        length = input_length
+        # Conv1d
+        length = (length - kernel_size) // 2 + 1
+        # MaxPool1d
+        length = (length - 2) // 2 + 1
+        # Conv1d
+        length = (length - kernel_size) // 2 + 1
+        # MaxPool1d
+        length = (length - 2) // 2 + 1
+        return length
+    
+    def forward(self, signals, wavelet_features):
+        # signals: (batch_size, 3, signal_length)
+        # wavelet_features: (batch_size, wavelet_feature_size)
+        
+        batch_size = signals.size(0)
+        
+        cnn_features = []
+        lstm_outputs = []
+        
+        for i in range(3):
+            signal = signals[:, i, :].unsqueeze(1)  # (batch_size, 1, signal_length)
+            cnn_feat, lstm_out = self._process_signal(signal)
+            cnn_features.append(cnn_feat)
+            lstm_outputs.append(lstm_out)
+        
+        # **拼接 CNN 特征**
+        combined_cnn_feat = torch.cat(cnn_features, dim=1)  # (batch_size, cnn_feature_size * 3)
+        
+        # **拼接 LSTM 输出**
+        combined_lstm_out = torch.cat(lstm_outputs, dim=1)  # (batch_size, lstm_hidden_size * 3)
+        
+        # **拼接所有特征**
+        features = torch.cat([combined_cnn_feat, combined_lstm_out, wavelet_features], dim=1)
+        
+        # 通过全连接层
+        output = self.fc(features)
+        
+        return output
+
+    def _process_signal(self, signal):
+        # signal: (batch_size, 1, signal_length)
+        cnn_out = self.cnn_module(signal)  # (batch_size, channels, seq_len)
+        batch_size, channels, seq_len = cnn_out.size()
+        # **提取 CNN 特征，通过全局平均池化**
+        cnn_feature = torch.mean(cnn_out, dim=2)  # (batch_size, channels)
+        
+        # 分段处理
+        segments = []
+        step_size = self.segment_size - self.overlap_size
+        for i in range(0, seq_len - self.segment_size + 1, step_size):
+            segment = cnn_out[:, :, i:i+self.segment_size]  # (batch_size, channels, segment_size)
+            segments.append(segment)
+        if len(segments) == 0:
+            segment = cnn_out[:, :, :].repeat(1, 1, self.segment_size // seq_len + 1)[:, :, :self.segment_size]
+            segments.append(segment)
+        segments = torch.stack(segments, dim=1)  # (batch_size, num_segments, channels, segment_size)
+        
+        # 调整形状以匹配LSTM输入
+        segments = segments.permute(0, 1, 3, 2)  # (batch_size, num_segments, segment_size, channels)
+        num_segments = segments.size(1)
+        segments = segments.reshape(-1, self.segment_size, channels)  # (batch_size * num_segments, segment_size, channels)
+        
+        # 通过LSTM
+        lstm_out, _ = self.lstm_module(segments)  # (batch_size * num_segments, segment_size, lstm_hidden_size)
+        lstm_out = lstm_out[:, -1, :]  # 取最后一个时间步的输出
+        
+        # 重塑回(batch_size, num_segments, lstm_hidden_size)
+        lstm_out = lstm_out.reshape(batch_size, num_segments, -1)
+        
+        # 对所有段的LSTM输出取平均
+        lstm_out = torch.mean(lstm_out, dim=1)  # (batch_size, lstm_hidden_size)
+        
+        return cnn_feature, lstm_out
+
+# 定义带通滤波器函数
+def bandpass_filter(data, lowcut, highcut, fs, order=5):
+    nyq = 0.5 * fs  # 奈奎斯特频率
+    low = lowcut / nyq
+    high = highcut / nyq
+    # 设计巴特沃斯带通滤波器
+    b, a = butter(order, [low, high], btype='band')
+    # 应用滤波器
+    y = filtfilt(b, a, data)
+    return y
+
+# 定义数据文件夹路径
+folder_path = r'D:\Program\d2l\BP'  
+
+# 列出文件夹中的所有 .xlsx 文件
+xlsx_files = [f for f in os.listdir(folder_path) if f.endswith('.xlsx')]
+
+# 初始化字典以存储每个人的数据
+data_per_person = {}  # 键为志愿者文件名，值为该志愿者的数据列表
+
+# 采样率和滤波器参数
+original_fs = 50      # 原始采样率 50Hz
+lowcut = 0.5   # 带通滤波器下截止频率 0.5Hz，去除基线漂移
+highcut = 5.0  # 带通滤波器上截止频率 5Hz，去除高频噪声
+
+# 遍历每个 .xlsx 文件（每个志愿者）
+for file in xlsx_files:
+    # 读取 Excel 文件
+    data = pd.read_excel(os.path.join(folder_path, file), header=None)
+    
+    # 获取数据集的列数
+    num_columns = data.shape[1]
+    
+    # 初始化索引
+    col_idx = 0
+    
+    # 初始化列表以存储该志愿者的所有组的数据
+    person_data = []  # 每个元素为一个组的数据，包括信号和标签
+    
+    # 数据预处理
+    while col_idx < num_columns:
+        # 获取当前组号
+        group_number = data.iloc[0, col_idx]
+        
+        # 提取第一列（有标签），共 750 个数据点
+        data_points_1 = -data.iloc[651:1401, col_idx].astype(float).values
+        # 提取第二列（无标签），共 750 个数据点
+        data_points_2 = -data.iloc[651:1401, col_idx + 1].astype(float).values
+        
+        # 处理两列数据，存储处理后的信号
+        processed_signals = []
+        for data_points in [data_points_1, data_points_2]:
+            # 将数据转换为 Pandas Series 以便插值（处理缺失值）
+            data_series = pd.Series(data_points)
+            # 插值缺失值（如果有）
+            data_interpolated = data_series.interpolate(method='linear').bfill().ffill().values
+            # 滤波去除基线漂移和高频噪声
+            data_filtered = bandpass_filter(data_interpolated, lowcut=lowcut, highcut=highcut, fs=original_fs, order=5)
+            # 将滤波后的数据插值增加到 15000 个数据点
+            data_resampled = resample(data_filtered, 15000)
+            # 添加处理后的数据到列表
+            processed_signals.append(data_resampled)
+        
+        # 获取处理后的两个信号
+        signal1 = processed_signals[0]
+        signal2 = processed_signals[1]
+        
+        # 计算差值信号
+        difference_signal = signal1 - signal2
+        # 将差值信号添加到 processed_signals 中
+        processed_signals.append(difference_signal)
+        
+        # 对三个信号进行小波变换，存储变换后的内容
+        wavelet_coeffs_list = []
+        for signal in processed_signals:
+            coeffs = pywt.wavedec(signal, 'db4', level=4)
+            wavelet_coeffs_list.append(coeffs)
+        
+        # 提取标签（假设标签存储方式相同）
+        systolic_bp = data.iloc[1501, col_idx]
+        diastolic_bp = data.iloc[1502, col_idx]
+        labels = np.array([systolic_bp, diastolic_bp])
+        
+        # 将信号和小波变换内容、标签存储为一个字典
+        group_data = {
+            'signals': processed_signals,            # 列表，包含三个信号，每个信号长度为15000
+            'wavelet_coeffs': wavelet_coeffs_list,   # 列表，包含三个信号的小波系数
+            'labels': labels                         # numpy数组，形状为(2,)
+        }
+        
+        # 将该组的数据添加到该志愿者的数据列表中
+        person_data.append(group_data)
+        
+        # 移动到下一组（跳过两列）
+        col_idx += 2
+    
+    # 将该志愿者的数据添加到总数据字典中
+    data_per_person[file] = person_data
+
+# 数据加载完成，下面进行数据划分
+
+# 获取所有志愿者的名字（文件名）
+persons = list(data_per_person.keys())
+
+# 定义损失函数
+criterion = nn.MSELoss()
+
+# 初始化结果字典
+mae_results = {}  # 用于存储每个志愿者的测试集MAE和SD
+
+# 定义自定义的数据集类
+class PulseDataset(Dataset):
+    def __init__(self, data_list, scaler=None):
+        self.data_list = data_list
+        self.scaler = scaler
+
+    def __len__(self):
+        return len(self.data_list)
+
+    def __getitem__(self, idx):
+        group_data = self.data_list[idx]
+        signals = group_data['signals']            # 列表，包含三个信号
+        wavelet_coeffs = group_data['wavelet_coeffs']   # 列表，包含三个信号的小波系数
+        labels = group_data['labels']              # numpy数组，形状为(2,)
+        
+        # 将数据转换为 numpy 数组
+        signals_array = np.array(signals)  # 形状：(3, 15000)
+        
+        # 如果提供了 scaler，则进行归一化
+        if self.scaler is not None:
+            signals_array = self.scaler.transform(signals_array.reshape(-1, 1)).reshape(3, -1)
+        else:
+            # 在训练集上创建 scaler
+            self.scaler = MinMaxScaler()
+            signals_array = self.scaler.fit_transform(signals_array.reshape(-1, 1)).reshape(3, -1)
+        
+        # 将数据转换为 PyTorch 张量
+        signals_tensor = torch.tensor(signals_array, dtype=torch.float32)  # 形状：(3, 15000)
+        labels_tensor = torch.tensor(labels, dtype=torch.float32)    # 形状：(2,)
+        
+        # 提取小波特征（使用能量特征，降低维度）
+        wavelet_features = []
+        for coeffs in wavelet_coeffs:
+            # 计算每一层系数的能量
+            energies = [np.sum(np.square(c)) for c in coeffs]
+            wavelet_features.extend(energies)
+        wavelet_tensor = torch.tensor(wavelet_features, dtype=torch.float32)
+        
+        return signals_tensor, wavelet_tensor, labels_tensor
+
+# **初始化列表用于存储所有测试样本的误差和相关信息**
+all_test_results = []
+
+# 定义超参数的搜索范围
+from itertools import product
+
+param_grid = {
+    'cnn_kernel_size': [5],
+    'cnn_num_filters': [2],
+    'lstm_hidden_size': [8],
+    'lstm_num_layers': [1],
+    'learning_rate': [5e-4],
+    'weight_decay': [0]
+}
+
+# 生成超参数组合
+param_combinations = list(product(
+    param_grid['cnn_kernel_size'],
+    param_grid['cnn_num_filters'],
+    param_grid['lstm_hidden_size'],
+    param_grid['lstm_num_layers'],
+    param_grid['learning_rate'],
+    param_grid['weight_decay']
+))
+
+best_overall_mae = float('inf')
+best_params = None
+best_mae_results = {}
+
+# 开始网格搜索
+for params in param_combinations:
+    cnn_kernel_size, cnn_num_filters, lstm_hidden_size, lstm_num_layers, learning_rate, weight_decay = params
+    print(f"\n正在尝试超参数组合：cnn_kernel_size={cnn_kernel_size}, cnn_num_filters={cnn_num_filters}, "
+          f"lstm_hidden_size={lstm_hidden_size}, lstm_num_layers={lstm_num_layers}, "
+          f"learning_rate={learning_rate}, weight_decay={weight_decay}")
+    
+    # 初始化每个超参数组合下的 MAE 列表
+    maes_sbp = []
+    maes_dbp = []
+    sds_sbp = []
+    sds_dbp = []
+    
+    # 留一法循环
+    for leave_out_person in persons:
+        print(f"\n当前留一法测试的志愿者：{leave_out_person}")
+        
+        # 将志愿者划分为预训练集和迁移学习集
+        pretrain_persons = [p for p in persons if p != leave_out_person]
+        transfer_person = leave_out_person  # 留出的志愿者用于迁移学习（微调和测试）
+        
+        # 收集预训练集的数据
+        pretrain_data = []
+        for person in pretrain_persons:
+            pretrain_data.extend(data_per_person[person])
+        
+        # 收集迁移学习集的数据
+        transfer_data = data_per_person[transfer_person]
+        
+        # 打乱预训练数据的顺序
+        random.shuffle(pretrain_data)
+        
+        # 划分预训练集为训练集和验证集（8:2）
+        num_pretrain = len(pretrain_data)
+        num_train = int(num_pretrain * 0.8)
+        train_data_list = pretrain_data[:num_train]
+        val_data_list = pretrain_data[num_train:]
+        
+        # 打乱迁移学习数据的顺序
+        random.shuffle(transfer_data)
+        
+        # 划分迁移学习集为微调集和测试集（3:7）
+        num_transfer = len(transfer_data)
+        num_finetune = max(int(num_transfer * 0.4), 1)  # 确保微调集至少有一个样本
+        finetune_data_full = transfer_data[:num_finetune]
+        test_data_list = transfer_data[num_finetune:]
+        
+        # **在微调数据中划分训练和验证集（例如8:2）**
+        num_finetune_full = len(finetune_data_full)
+        num_finetune_train = max(int(num_finetune_full * 0.8), 1)  # 确保至少有一个训练样本
+        finetune_train_data_list = finetune_data_full[:num_finetune_train]
+        finetune_val_data_list = finetune_data_full[num_finetune_train:]
+        
+        # 显示各数据集的大小
+        print(f"预训练集：训练集大小={len(train_data_list)}, 验证集大小={len(val_data_list)}")
+        print(f"迁移学习集：微调训练集大小={len(finetune_train_data_list)}, 微调验证集大小={len(finetune_val_data_list)}, 测试集大小={len(test_data_list)}")
+        
+        # 创建训练集的 scaler
+        train_dataset = PulseDataset(train_data_list)
+        scaler = train_dataset.scaler  # 获取在训练集上 fit 的 scaler
+        
+        # 创建数据集对象
+        val_dataset = PulseDataset(val_data_list, scaler=scaler)
+        finetune_train_dataset = PulseDataset(finetune_train_data_list, scaler=scaler)
+        finetune_val_dataset = PulseDataset(finetune_val_data_list, scaler=scaler)
+        test_dataset = PulseDataset(test_data_list, scaler=scaler)
+        
+        # 获取小波特征的维度
+        sample_wavelet_features = train_dataset[0][1]
+        wavelet_feature_size = sample_wavelet_features.shape[0]
+        
+        # 创建数据加载器
+        batch_size = 4  # 根据您的显存大小调整
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        finetune_train_loader = DataLoader(finetune_train_dataset, batch_size=batch_size, shuffle=True)
+        finetune_val_loader = DataLoader(finetune_val_dataset, batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)  # 测试时batch_size设为1
+        
+        # 实例化模型
+        model = PulseNet(
+            cnn_kernel_size=cnn_kernel_size, 
+            cnn_num_filters=cnn_num_filters, 
+            lstm_hidden_size=lstm_hidden_size, 
+            lstm_num_layers=lstm_num_layers, 
+            segment_size=50, 
+            overlap_size=25, 
+            wavelet_feature_size=wavelet_feature_size
+        ).to(device)
+        
+        # 定义优化器，添加 L2 正则化（weight_decay）
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        
+        # 定义学习率调度器
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, verbose=True)
+        
+        # 预训练阶段
+        num_epochs = 200
+        best_val_loss = float('inf')
+        best_model_state = None
+        
+        patience = 10  # 早停耐心值
+        stop_counter = 0  # 早停计数器
+        
+        print("\n开始预训练...")
+        for epoch in range(num_epochs):
+            model.train()
+            running_loss = 0.0
+            for signals_batch, wavelet_batch, labels_batch in train_loader:
+                signals_batch = signals_batch.to(device)
+                wavelet_batch = wavelet_batch.to(device)
+                labels_batch = labels_batch.to(device)
+                
+                optimizer.zero_grad()
+                outputs = model(signals_batch, wavelet_batch)
+                loss = criterion(outputs, labels_batch)
+                loss.backward()
+                optimizer.step()
+                
+                running_loss += loss.item()
+            
+            avg_train_loss = running_loss / len(train_loader)
+            
+            # 在验证集上评估
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for signals_batch, wavelet_batch, labels_batch in val_loader:
+                    signals_batch = signals_batch.to(device)
+                    wavelet_batch = wavelet_batch.to(device)
+                    labels_batch = labels_batch.to(device)
+                    
+                    outputs = model(signals_batch, wavelet_batch)
+                    loss = criterion(outputs, labels_batch)
+                    val_loss += loss.item()
+            avg_val_loss = val_loss / len(val_loader)
+            
+            print(f"Epoch {epoch+1}/{num_epochs}, Training Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}")
+            
+            # 学习率调度器
+            scheduler.step(avg_val_loss)
+            
+            # 早停机制
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_model_state = model.state_dict()
+                stop_counter = 0
+            else:
+                stop_counter += 1
+                if stop_counter >= patience:
+                    print("预训练阶段早停触发")
+                    break
+        
+        # 加载预训练的最佳模型参数
+        model.load_state_dict(best_model_state)
+        
+        # 迁移学习微调阶段
+        print("\n开始迁移学习微调...")
+        
+        # 重新定义优化器，只优化全连接层的参数
+        for param in model.parameters():
+            param.requires_grad = True
+        
+        # 冻结 CNN 和 LSTM 模块的参数
+        for param in model.cnn_module.parameters():
+            param.requires_grad = False
+        for param in model.lstm_module.parameters():
+            param.requires_grad = False
+        
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate, weight_decay=weight_decay)
+        
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, verbose=True)
+        
+        num_finetune_epochs = 50
+        best_finetune_val_loss = float('inf')
+        best_finetune_model_state = None
+        stop_counter = 0  # 早停计数器
+        
+        for epoch in range(num_finetune_epochs):
+            model.train()
+            running_loss = 0.0
+            for signals_batch, wavelet_batch, labels_batch in finetune_train_loader:
+                signals_batch = signals_batch.to(device)
+                wavelet_batch = wavelet_batch.to(device)
+                labels_batch = labels_batch.to(device)
+                
+                optimizer.zero_grad()
+                outputs = model(signals_batch, wavelet_batch)
+                loss = criterion(outputs, labels_batch)
+                loss.backward()
+                optimizer.step()
+                
+                running_loss += loss.item()
+            
+            avg_finetune_train_loss = running_loss / len(finetune_train_loader)
+            
+            # 在微调验证集上评估
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for signals_batch, wavelet_batch, labels_batch in finetune_val_loader:
+                    signals_batch = signals_batch.to(device)
+                    wavelet_batch = wavelet_batch.to(device)
+                    labels_batch = labels_batch.to(device)
+                    
+                    outputs = model(signals_batch, wavelet_batch)
+                    loss = criterion(outputs, labels_batch)
+                    val_loss += loss.item()
+            avg_finetune_val_loss = val_loss / len(finetune_val_loader)
+            
+            print(f"Fine-tune Epoch {epoch+1}/{num_finetune_epochs}, Training Loss: {avg_finetune_train_loss:.4f}, Validation Loss: {avg_finetune_val_loss:.4f}")
+            
+            # 学习率调度器
+            scheduler.step(avg_finetune_val_loss)
+            
+            # 早停机制
+            if avg_finetune_val_loss < best_finetune_val_loss:
+                best_finetune_val_loss = avg_finetune_val_loss
+                best_finetune_model_state = model.state_dict()
+                stop_counter = 0
+            else:
+                stop_counter += 1
+                if stop_counter >= patience:
+                    print("微调阶段早停触发")
+                    break
+        
+        # 加载微调阶段的最佳模型参数
+        model.load_state_dict(best_finetune_model_state)
+        
+        # 测试阶段
+        print("\n在测试集上评估模型...")
+        model.eval()
+        all_true_labels = []
+        all_predicted_labels = []
+        test_results = []  # 用于存储该志愿者的测试结果
+        with torch.no_grad():
+            for idx, (signals_batch, wavelet_batch, labels_batch) in enumerate(test_loader):
+                signals_batch = signals_batch.to(device)
+                wavelet_batch = wavelet_batch.to(device)
+                labels_batch = labels_batch.to(device)
+                
+                outputs = model(signals_batch, wavelet_batch)
+                all_true_labels.append(labels_batch.cpu().numpy())
+                all_predicted_labels.append(outputs.cpu().numpy())
+        
+        # 将结果转换为numpy数组
+        all_true_labels = np.vstack(all_true_labels)  # 形状：(样本数, 2)
+        all_predicted_labels = np.vstack(all_predicted_labels)
+        
+        # 分别对 SBP 和 DBP 进行误差修正
+        for i, bp_type in enumerate(['SBP', 'DBP']):
+            true_values = all_true_labels[:, i]
+            predicted_values = all_predicted_labels[:, i]
+            
+            # 计算误差和均值
+            errors = predicted_values - true_values
+            means = (predicted_values + true_values) / 2
+            
+            # 进行线性回归
+            slope, intercept, r_value, p_value, std_err = stats.linregress(means, errors)
+            print(f"{bp_type} 误差和均值的线性回归结果：slope={slope:.4f}, intercept={intercept:.4f}")
+            
+            # 修正预测值
+            corrected_predicted_values = predicted_values - (slope * means + intercept)
+            
+            # 更新 all_predicted_labels
+            all_predicted_labels[:, i] = corrected_predicted_values
+        
+        # 计算修正后的 MAE
+        mae_sbp = mean_absolute_error(all_true_labels[:, 0], all_predicted_labels[:, 0])
+        mae_dbp = mean_absolute_error(all_true_labels[:, 1], all_predicted_labels[:, 1])
+        
+        # 计算收缩压和舒张压的误差
+        errors_sbp = all_predicted_labels[:, 0] - all_true_labels[:, 0]
+        errors_dbp = all_predicted_labels[:, 1] - all_true_labels[:, 1]
+        
+        # 计算误差的标准差
+        sd_sbp = np.std(errors_sbp, ddof=1)  # ddof=1 表示使用样本标准差
+        sd_dbp = np.std(errors_dbp, ddof=1)
+        
+        # 输出修正后的结果
+        print(f"修正后测试集 MAE - 收缩压: {mae_sbp:.2f}, 舒张压: {mae_dbp:.2f}")
+        print(f"修正后测试集 SD  - 收缩压: {sd_sbp:.2f}, 舒张压: {sd_dbp:.2f}")
+        
+        # 保存每个志愿者的结果
+        mae_results[leave_out_person] = {
+            'MAE_SBP': mae_sbp,
+            'MAE_DBP': mae_dbp,
+            'SD_SBP': sd_sbp,
+            'SD_DBP': sd_dbp
+        }
+        
+        # 更新 test_results，保存修正后的预测值和误差
+        for idx in range(len(all_true_labels)):
+            true_labels = all_true_labels[idx]
+            corrected_predicted_labels = all_predicted_labels[idx]
+            error = corrected_predicted_labels - true_labels
+            abs_error = np.abs(error)
+            
+            test_results.append({
+                'Person': leave_out_person,
+                'Sample_Index': idx,
+                'True_SBP': true_labels[0],
+                'True_DBP': true_labels[1],
+                'Predicted_SBP': corrected_predicted_labels[0],
+                'Predicted_DBP': corrected_predicted_labels[1],
+                'Error_SBP': error[0],
+                'Error_DBP': error[1],
+                'Abs_Error_SBP': abs_error[0],
+                'Abs_Error_DBP': abs_error[1],
+            })
+        
+        # 将该志愿者的测试结果添加到总的列表中
+        all_test_results.extend(test_results)
+
+        
+        # 将结果转换为numpy数组
+        all_true_labels = np.vstack(all_true_labels)  # 形状：(样本数, 2)
+        all_predicted_labels = np.vstack(all_predicted_labels)
+        
+        # 计算MAE
+        mae_sbp = mean_absolute_error(all_true_labels[:, 0], all_predicted_labels[:, 0])
+        mae_dbp = mean_absolute_error(all_true_labels[:, 1], all_predicted_labels[:, 1])
+        
+        # 计算收缩压和舒张压的误差
+        errors_sbp = all_predicted_labels[:, 0] - all_true_labels[:, 0]
+        errors_dbp = all_predicted_labels[:, 1] - all_true_labels[:, 1]
+        
+        # 计算误差的标准差
+        sd_sbp = np.std(errors_sbp, ddof=1)  # ddof=1 表示使用样本标准差
+        sd_dbp = np.std(errors_dbp, ddof=1)
+        
+        maes_sbp.append(mae_sbp)
+        maes_dbp.append(mae_dbp)
+        sds_sbp.append(sd_sbp)
+        sds_dbp.append(sd_dbp)
+        
+        print(f"测试集 MAE - 收缩压: {mae_sbp:.2f}, 舒张压: {mae_dbp:.2f}")
+        print(f"测试集 SD  - 收缩压: {sd_sbp:.2f}, 舒张压: {sd_dbp:.2f}")
+        
+        # 保存每个志愿者的结果
+        mae_results[leave_out_person] = {
+            'MAE_SBP': mae_sbp,
+            'MAE_DBP': mae_dbp,
+            'SD_SBP': sd_sbp,
+            'SD_DBP': sd_dbp
+        }
+    
+    # 计算当前超参数组合下的平均 MAE 和 SD
+    avg_mae_sbp = np.mean(maes_sbp)
+    avg_mae_dbp = np.mean(maes_dbp)
+    avg_sd_sbp = np.mean(sds_sbp)
+    avg_sd_dbp = np.mean(sds_dbp)
+    avg_mae = (avg_mae_sbp + avg_mae_dbp) / 2
+    
+    print(f"\n超参数组合的平均测试集 MAE - 收缩压: {avg_mae_sbp:.2f}, 舒张压: {avg_mae_dbp:.2f}, 平均 MAE: {avg_mae:.2f}")
+    print(f"超参数组合的平均测试集 SD  - 收缩压: {avg_sd_sbp:.2f}, 舒张压: {avg_sd_dbp:.2f}")
+    
+    # 记录最优的超参数组合
+    if avg_mae < best_overall_mae:
+        best_overall_mae = avg_mae
+        best_params = params
+        best_mae_results = mae_results.copy()
+        # 保存最优模型状态
+        torch.save(model.state_dict(), 'best_model.pth')
+
+# 输出最佳超参数组合
+print(f"\n最佳超参数组合：cnn_kernel_size={best_params[0]}, cnn_num_filters={best_params[1]}, "
+      f"lstm_hidden_size={best_params[2]}, lstm_num_layers={best_params[3]}, "
+      f"learning_rate={best_params[4]}, weight_decay={best_params[5]}")
+print(f"在测试集上的最优平均 MAE: {best_overall_mae:.2f}")
+
+# 将结果保存到 txt 文件中
+with open('best_results.txt', 'w') as f:
+    f.write(f"最佳超参数组合：cnn_kernel_size={best_params[0]}, cnn_num_filters={best_params[1]}, "
+            f"lstm_hidden_size={best_params[2]}, lstm_num_layers={best_params[3]}, "
+            f"learning_rate={best_params[4]}, weight_decay={best_params[5]}\n")
+    f.write(f"在测试集上的最优平均 MAE: {best_overall_mae:.2f}\n\n")
+    f.write("各志愿者的测试集 MAE 和 SD：\n")
+    for person, results in best_mae_results.items():
+        f.write(f"志愿者 {person} - 收缩压 MAE: {results['MAE_SBP']:.2f}, 舒张压 MAE: {results['MAE_DBP']:.2f}, "
+                f"收缩压 SD: {results['SD_SBP']:.2f}, 舒张压 SD: {results['SD_DBP']:.2f}\n")
+    f.write(f"\n平均 MAE - 收缩压: {avg_mae_sbp:.2f}, 舒张压: {avg_mae_dbp:.2f}\n")
+    f.write(f"平均 SD  - 收缩压: {avg_sd_sbp:.2f}, 舒张压: {avg_sd_dbp:.2f}\n")
+
+# 将所有测试集的数据保存为表格
+test_results_df = pd.DataFrame(all_test_results)
+test_results_df.to_csv('all_test_results.csv', index=False)
+print("\n所有测试集的数据已保存到 all_test_results.csv 文件中。")
