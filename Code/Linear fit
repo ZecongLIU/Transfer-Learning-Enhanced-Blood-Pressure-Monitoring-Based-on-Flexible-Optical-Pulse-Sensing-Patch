@@ -1,0 +1,332 @@
+# 导入必要的库
+import pandas as pd
+import numpy as np
+from scipy.signal import butter, filtfilt, resample, find_peaks
+import matplotlib.pyplot as plt
+import os
+
+# 定义带通滤波器函数
+def bandpass_filter(data, lowcut, highcut, fs, order=5):
+    nyq = 0.5 * fs  # 奈奎斯特频率
+    low = lowcut / nyq
+    high = highcut / nyq
+    # 设计巴特沃斯带通滤波器
+    b, a = butter(order, [low, high], btype='band')
+    # 应用滤波器
+    y = filtfilt(b, a, data)
+    return y
+
+# 定义计算 PTT 的函数，使用双指针法匹配峰值对
+def calculate_PTT(signal1, signal2, fs, plot=True, person='', group=''):
+    # 检测两个信号中的峰值
+    min_peak_distance = fs * 0.5  # 将最小峰值间隔设置为 0.5 秒
+    peaks1, _ = find_peaks(signal1, distance=min_peak_distance)
+    peaks2, _ = find_peaks(signal2, distance=min_peak_distance)
+
+    if len(peaks1) == 0 or len(peaks2) == 0:
+        return np.nan  # 如果未检测到峰值，无法计算 PTT
+
+    # 将峰值索引转换为时间（秒）
+    times1 = peaks1 / fs  # 信号1的峰值时间
+    times2 = peaks2 / fs  # 信号2的峰值时间
+
+    # 初始化指针和有效时间差列表
+    i = 0
+    j = 0
+    valid_time_diffs_ms = []
+    max_time_diff_ms = 100  # 最大时间差为 10 毫秒
+
+    # 使用双指针法匹配最近的峰值对
+    while i < len(times1) and j < len(times2):
+        delta_t = (times2[j] - times1[i]) * 1000  # 计算时间差，单位为毫秒
+
+        if abs(delta_t) <= max_time_diff_ms:
+            # 匹配成功，保存绝对时间差
+            valid_time_diffs_ms.append(abs(delta_t))
+            i += 1
+            j += 1
+        else:
+            # 移动较早的峰值指针
+            if times1[i] < times2[j]:
+                i += 1
+            else:
+                j += 1
+
+    # 如果没有找到有效的峰值对，返回 NaN
+    if len(valid_time_diffs_ms) == 0:
+        return np.nan
+
+    # 计算 PTT 为有效时间差的平均值
+    PTT = np.mean(valid_time_diffs_ms)  # 单位为毫秒
+
+    # 如果需要绘图
+    if plot:
+        time = np.arange(len(signal1)) / fs  # 时间轴，单位为秒
+        plt.figure(figsize=(12, 6))
+        plt.plot(time, signal1, label='Signal 1')
+        plt.plot(times1, signal1[peaks1], 'x', label='Peaks Signal 1')
+        plt.plot(time, signal2, label='Signal 2')
+        plt.plot(times2, signal2[peaks2], 'o', label='Peaks Signal 2')
+        plt.title(f'Person: {person}, Group: {group}, PTT: {PTT:.2f} ms')
+        plt.xlabel('Time (s)')
+        plt.ylabel('Amplitude')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+    return PTT
+
+
+# 定义数据文件夹路径
+folder_path = r'D:\Program\d2l\BP'
+
+# 列出文件夹中的所有 .xlsx 文件
+xlsx_files = [f for f in os.listdir(folder_path) if f.endswith('.xlsx')]
+
+# 采样率和滤波器参数
+original_fs = 50      # 原始采样率 50Hz
+lowcut = 0.5   # 带通滤波器下截止频率 0.5Hz
+highcut = 5.0  # 带通滤波器上截止频率 5Hz
+
+# 初始化字典以存储每个人的数据
+data_per_person = {}  # 键为志愿者文件名，值为该志愿者的数据列表
+
+# 遍历每个 .xlsx 文件（每个志愿者）
+for file in xlsx_files:
+    # 读取 Excel 文件
+    data = pd.read_excel(os.path.join(folder_path, file), header=None)
+
+    # 获取数据集的列数
+    num_columns = data.shape[1]
+
+    # 初始化索引
+    col_idx = 0
+
+    # 初始化列表以存储该志愿者的所有组的数据
+    person_data = []  # 每个元素为一个组的数据，包括 PTT 和标签
+
+    # 数据预处理
+    while col_idx < num_columns:
+        # 获取当前组号
+        group_number = data.iloc[0, col_idx]
+
+        # 提取第一列（有标签），共 750 个数据点
+        data_points_1 = -data.iloc[651:1401, col_idx].astype(float).values
+        # 提取第二列（无标签），共 750 个数据点
+        data_points_2 = -data.iloc[651:1401, col_idx + 1].astype(float).values
+
+        # 处理两列数据，存储处理后的信号
+        processed_signals = []
+        for data_points in [data_points_1, data_points_2]:
+            # 将数据转换为 Pandas Series 以便插值（处理缺失值）
+            data_series = pd.Series(data_points)
+            # 插值缺失值（如果有）
+            data_interpolated = data_series.interpolate(method='linear').bfill().ffill().values
+            # 滤波去除基线漂移和高频噪声
+            data_filtered = bandpass_filter(data_interpolated, lowcut=lowcut, highcut=highcut, fs=original_fs, order=5)
+            # 将滤波后的数据重新采样到 1000 个数据点
+            data_resampled = resample(data_filtered, 1000)
+            # 添加处理后的数据到列表
+            processed_signals.append(data_resampled)
+
+        # 获取处理后的两个信号
+        signal1 = processed_signals[0]
+        signal2 = processed_signals[1]
+
+        # 计算重新采样后的采样率
+        duration = len(data_filtered) / original_fs  # 持续时间（秒）
+        fs_resampled = len(data_resampled) / duration  # 重新采样后的采样率
+
+        # 计算 PTT 并绘图
+        PTT = calculate_PTT(signal1, signal2, fs=fs_resampled, plot=True, person=file, group=group_number)
+
+        # 如果 PTT 计算失败，跳过该样本
+        if np.isnan(PTT):
+            col_idx += 2  # 跳过当前样本，继续下一组
+            continue  # 不将该样本加入数据集
+
+        # 提取标签（假设标签存储方式相同）
+        systolic_bp = data.iloc[1501, col_idx]
+        diastolic_bp = data.iloc[1502, col_idx]
+        labels = np.array([systolic_bp, diastolic_bp])
+
+        # 将 PTT 和标签存储为一个字典
+        group_data = {
+            'PTT': PTT,
+            'labels': labels,
+            'group_number': group_number  # 添加组号，便于跟踪
+        }
+
+        # 将该组的数据添加到该志愿者的数据列表中
+        person_data.append(group_data)
+
+        # 移动到下一组（跳过两列）
+        col_idx += 2
+
+    # 将该志愿者的数据添加到总数据字典中
+    data_per_person[file] = person_data
+
+# 数据加载完成，下面进行数据划分
+
+# 获取所有志愿者的名字（文件名）
+persons = list(data_per_person.keys())
+
+# 初始化结果列表
+mae_sbp_list = []
+mae_dbp_list = []
+sd_sbp_list = []
+sd_dbp_list = []
+
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error
+
+# **初始化列表用于存储所有的计算结果**
+all_results = []
+summary_results = []  # 用于存储每个志愿者的 MAE 和 SD
+
+# 留一法循环
+for leave_out_person in persons:
+    print(f"\n当前留一法测试的志愿者：{leave_out_person}")
+
+    # 收集其他志愿者的训练数据
+    train_PTT = []
+    train_SBP = []
+    train_DBP = []
+
+    for person in persons:
+        if person != leave_out_person:
+            person_data = data_per_person[person]
+            for group_data in person_data:
+                PTT = group_data['PTT']
+                labels = group_data['labels']
+                if not np.isnan(PTT):
+                    train_PTT.append(PTT)
+                    train_SBP.append(labels[0])
+                    train_DBP.append(labels[1])
+
+    # 将训练数据转换为 numpy 数组
+    train_PTT = np.array(train_PTT).reshape(-1, 1)
+    train_SBP = np.array(train_SBP)
+    train_DBP = np.array(train_DBP)
+
+    # 检查训练数据是否为空
+    if len(train_PTT) == 0:
+        print("训练集中没有有效的样本，跳过此志愿者。")
+        continue
+
+    # 拟合线性回归模型
+    model_SBP = LinearRegression()
+    model_SBP.fit(train_PTT, train_SBP)
+    a_SBP = model_SBP.coef_[0]
+    b_SBP = model_SBP.intercept_
+
+    model_DBP = LinearRegression()
+    model_DBP.fit(train_PTT, train_DBP)
+    a_DBP = model_DBP.coef_[0]
+    b_DBP = model_DBP.intercept_
+
+    print(f"收缩压模型参数：a = {a_SBP:.4f}, b = {b_SBP:.4f}")
+    print(f"舒张压模型参数：a = {a_DBP:.4f}, b = {b_DBP:.4f}")
+
+    # 在留出的志愿者上测试模型
+    test_PTT = []
+    test_SBP_true = []
+    test_DBP_true = []
+    test_group_numbers = []  # 存储组号
+    person_data = data_per_person[leave_out_person]
+    for group_data in person_data:
+        PTT = group_data['PTT']
+        labels = group_data['labels']
+        group_number = group_data['group_number']
+        if not np.isnan(PTT):
+            test_PTT.append(PTT)
+            test_SBP_true.append(labels[0])
+            test_DBP_true.append(labels[1])
+            test_group_numbers.append(group_number)
+
+    # 检查测试数据是否为空
+    if len(test_PTT) == 0:
+        print("测试集中没有有效的样本，跳过此志愿者。")
+        continue
+
+    # 将测试数据转换为 numpy 数组
+    test_PTT = np.array(test_PTT).reshape(-1, 1)
+    test_SBP_true = np.array(test_SBP_true)
+    test_DBP_true = np.array(test_DBP_true)
+
+    # 使用模型预测血压
+    test_SBP_pred = model_SBP.predict(test_PTT)
+    test_DBP_pred = model_DBP.predict(test_PTT)
+
+    # 计算误差
+    errors_SBP = test_SBP_pred - test_SBP_true
+    errors_DBP = test_DBP_pred - test_DBP_true
+
+    # 计算 MAE
+    mae_SBP = mean_absolute_error(test_SBP_true, test_SBP_pred)
+    mae_DBP = mean_absolute_error(test_DBP_true, test_DBP_pred)
+
+    # 计算标准差 SD
+    sd_SBP = np.std(errors_SBP, ddof=1)
+    sd_DBP = np.std(errors_DBP, ddof=1)
+
+    print(f"测试集 MAE - 收缩压: {mae_SBP:.2f}, 舒张压: {mae_DBP:.2f}")
+    print(f"测试集 SD  - 收缩压: {sd_SBP:.2f}, 舒张压: {sd_DBP:.2f}")
+
+    mae_sbp_list.append(mae_SBP)
+    mae_dbp_list.append(mae_DBP)
+    sd_sbp_list.append(sd_SBP)
+    sd_dbp_list.append(sd_DBP)
+
+    # **记录每个测试样本的结果**
+    for idx in range(len(test_PTT)):
+        result = {
+            'Test_Person': leave_out_person,
+            'Group_Number': test_group_numbers[idx],
+            'PTT': test_PTT[idx][0],
+            'True_SBP': test_SBP_true[idx],
+            'Predicted_SBP': test_SBP_pred[idx],
+            'Error_SBP': errors_SBP[idx],
+            'True_DBP': test_DBP_true[idx],
+            'Predicted_DBP': test_DBP_pred[idx],
+            'Error_DBP': errors_DBP[idx],
+            'a_SBP': a_SBP,
+            'b_SBP': b_SBP,
+            'a_DBP': a_DBP,
+            'b_DBP': b_DBP
+        }
+        all_results.append(result)
+
+    # **记录每个志愿者的 MAE 和 SD**
+    summary = {
+        'Test_Person': leave_out_person,
+        'MAE_SBP': mae_SBP,
+        'MAE_DBP': mae_DBP,
+        'SD_SBP': sd_SBP,
+        'SD_DBP': sd_DBP
+    }
+    summary_results.append(summary)
+
+# 检查是否有有效的结果
+if len(mae_sbp_list) == 0:
+    print("\n没有足够的数据进行计算。")
+else:
+    # 计算平均 MAE 和 SD
+    avg_mae_sbp = np.mean(mae_sbp_list)
+    avg_mae_dbp = np.mean(mae_dbp_list)
+    avg_sd_sbp = np.mean(sd_sbp_list)
+    avg_sd_dbp = np.mean(sd_dbp_list)
+
+    print(f"\n平均测试集 MAE - 收缩压: {avg_mae_sbp:.2f}, 舒张压: {avg_mae_dbp:.2f}")
+    print(f"平均测试集 SD  - 收缩压: {avg_sd_sbp:.2f}, 舒张压: {avg_sd_dbp:.2f}")
+
+    # **将所有结果保存到表格中**
+    results_df = pd.DataFrame(all_results)
+    results_df.to_csv('PTT_BP_Results_NearestPeak.csv', index=False)
+    print("\n所有计算结果已保存到 PTT_BP_Results_NearestPeak.csv 文件中。")
+
+    # **将每个志愿者的 MAE 和 SD 保存到表格中**
+    summary_df = pd.DataFrame(summary_results)
+    summary_df.loc['平均'] = summary_df.mean(numeric_only=True)
+    summary_df.to_csv('PTT_BP_Summary_NearestPeak.csv', index=False)
+    print("\n每个志愿者的 MAE 和 SD 已保存到 PTT_BP_Summary_NearestPeak.csv 文件中。")
